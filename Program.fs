@@ -47,13 +47,12 @@ module Parser =
             | Success (s,_,_) -> Choice1Of2 s
             | Failure (f,_,_) -> Choice2Of2 f
 
+    let parseRangeHeader rangeHeader ctx =
+        ranges rangeHeader 
+        |> Choice.mapRight (fun _ -> RequestErrors.BAD_REQUEST "invalid range header" ctx)
 
 module Local =
     let streamFile filePath : WebPart =
-        let parseRangeHeader rangeHeader ctx =
-            Parser.ranges rangeHeader 
-            |> Choice.mapRight (fun _ -> RequestErrors.BAD_REQUEST "invalid range header" ctx)
-
         let streamFileImpl ranges ctx =
             let task (rstart, rend) (conn, _) =
                 socket {
@@ -87,7 +86,61 @@ module Local =
             async {
                 return! ctx.request.header "Range"
                 |> Choice.mapRight (fun _ -> RequestErrors.BAD_REQUEST "missing range header" ctx)
-                |> Choice.bindLeft (fun rangeHeader -> parseRangeHeader rangeHeader ctx)
+                |> Choice.bindLeft (fun rangeHeader -> Parser.parseRangeHeader rangeHeader ctx)
+                |> Choice.mapLeft (fun ranges -> streamFileImpl ranges ctx)
+                |> Choice.unwrap
+            }
+
+module Azure =
+    open Microsoft.WindowsAzure.Storage
+
+    [<Literal>]
+    let ConnectionString = "<place connectionstring here>"
+
+    let openBlobStream containerName blobName =
+        async {
+            let account = Microsoft.WindowsAzure.Storage.CloudStorageAccount.Parse(ConnectionString)
+            let client = account.CreateCloudBlobClient()
+            let container = client.GetContainerReference(containerName)
+            let blob = container.GetBlockBlobReference(blobName)
+            return! blob.OpenReadAsync() |> Async.AwaitTask
+        }
+
+    let streamFile containerName blobName : WebPart =
+        let streamFileImpl ranges ctx =
+            let task (rstart, rend) (conn, _) =
+                socket {
+                    use! stream = openBlobStream containerName blobName |> SocketOp.ofAsync
+                    let rend = rend |> Option.defaultValue (stream.Length - 1L)
+                    let documentLength = stream.Length
+                    let contentLength = 1L + rend - rstart
+                    let! (_,conn) = asyncWriteLn "Accept-Ranges: bytes" conn
+                    let! (_,conn) = asyncWriteLn (sprintf "Content-Length: %d" contentLength) conn
+                    let! (_,conn) = asyncWriteLn (sprintf "Content-Range: bytes %d-%d/%d" rstart rend documentLength) conn
+                    let! (_,conn) = asyncWriteLn "" conn
+                    let! conn = flush conn
+                    stream.Position <- rstart
+                    do! transferStream conn stream
+                    return conn
+                }
+            
+            match ranges with
+            | [x] ->
+                let ctx' =
+                    { ctx with
+                        response = 
+                            { ctx.response with 
+                                status = HTTP_206.status
+                                content = task x |> SocketTask } }
+                succeed ctx'
+            | _ ->
+                ServerErrors.INTERNAL_ERROR "not supported" ctx
+
+        fun ctx ->
+            async {
+                return! ctx.request.header "Range"
+                |> Choice.mapRight (fun _ -> RequestErrors.BAD_REQUEST "missing range header" ctx)
+                |> Choice.bindLeft (fun rangeHeader -> Parser.parseRangeHeader rangeHeader ctx)
                 |> Choice.mapLeft (fun ranges -> streamFileImpl ranges ctx)
                 |> Choice.unwrap
             }
@@ -97,7 +150,8 @@ let videoPath =
 
 let app =
     choose [
-        GET >=> path "/stream.mp4" >=> Local.streamFile videoPath
+        GET >=> path "/local/stream.mp4" >=> Local.streamFile videoPath
+        GET >=> path "/azure/stream.mp4" >=> Azure.streamFile "demo" "SampleVideo_1280x720_1mb.mp4"
         GET >=> OK "Hello World from F#!"
     ]
 
